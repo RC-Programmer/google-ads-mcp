@@ -13,6 +13,7 @@
 # limitations under the License.
 """Entry point for the MCP server."""
 import os
+import uvicorn
 from ads_mcp.coordinator import mcp
 # The following imports are necessary to register the tools with the `mcp`
 # object, even though they are not directly used in this file.
@@ -25,9 +26,8 @@ def run_server() -> None:
     
     if transport == "sse":
         port = int(os.environ.get("PORT", "8080"))
-        os.environ["MCP_HTTP_PORT"] = str(port)
-        os.environ["MCP_HTTP_HOST"] = "0.0.0.0"
-        mcp.run(transport="sse")
+        app = mcp.sse_app()
+        uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         mcp.run()
 
