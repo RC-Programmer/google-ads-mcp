@@ -4,61 +4,43 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8080;
-const MCP_URL = process.env.MCP_URL; // should point to your supergateway MCP endpoint (e.g. https://.../mcp)
+const MCP_URL = process.env.MCP_URL;
 const API_TOKEN = process.env.API_TOKEN;
 
 if (!MCP_URL) throw new Error("Missing MCP_URL");
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 
-function normalizeToken(v) {
-  if (!v) return "";
-  // trims, removes surrounding < > that people accidentally paste
-  return String(v).trim().replace(/^<|>$/g, "");
-}
-
 function requireAuth(req, res, next) {
-  const authRaw = (req.headers.authorization || "").trim();
-  const xApiKeyRaw = (req.headers["x-api-key"] || "").trim();
-  const apiKeyRaw = (req.headers["api-key"] || "").trim();
-
-  const auth = normalizeToken(authRaw);
-  const xApiKey = normalizeToken(xApiKeyRaw);
-  const apiKey = normalizeToken(apiKeyRaw);
-
-  const expected = normalizeToken(API_TOKEN);
+  const auth = String(req.headers.authorization || "").trim();
+  const xApiKey = String(req.headers["x-api-key"] || "").trim();
+  const apiKey = String(req.headers["api-key"] || "").trim();
 
   const ok =
-    auth === `Bearer ${expected}` ||
-    auth === expected ||
-    xApiKey === expected ||
-    apiKey === expected;
+    auth === `Bearer ${API_TOKEN}` ||
+    auth === API_TOKEN ||
+    xApiKey === API_TOKEN ||
+    apiKey === API_TOKEN;
 
   if (!ok) return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
-let rpcId = 1;
+function parseMcpSsePayload(sseText) {
+  const lines = String(sseText || "").split("\n");
+  const dataLines = lines.filter((l) => l.startsWith("data: "));
+  if (!dataLines.length) return null;
 
-function parseMcpResponseText(text) {
-  // supergateway often replies as text/event-stream, so we extract the LAST data: line
-  const dataLines = text
-    .split("\n")
-    .map((l) => l.trimEnd())
-    .filter((l) => l.startsWith("data: "));
+  // Take the last data: line (some responses can include multiple events)
+  const last = dataLines[dataLines.length - 1].slice("data: ".length).trim();
+  if (!last) return null;
 
-  if (dataLines.length > 0) {
-    const last = dataLines[dataLines.length - 1].slice("data: ".length);
-    return JSON.parse(last);
-  }
-
-  // sometimes it may be plain JSON
-  return JSON.parse(text);
+  return JSON.parse(last);
 }
 
 async function callMcpTool(toolName, args) {
   const body = {
     jsonrpc: "2.0",
-    id: rpcId++,
+    id: Date.now(),
     method: "tools/call",
     params: { name: toolName, arguments: args || {} }
   };
@@ -67,7 +49,7 @@ async function callMcpTool(toolName, args) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream"
+      Accept: "application/json, text/event-stream"
     },
     body: JSON.stringify(body)
   });
@@ -76,26 +58,33 @@ async function callMcpTool(toolName, args) {
 
   let payload;
   try {
-    payload = parseMcpResponseText(text);
+    payload = parseMcpSsePayload(text);
   } catch (e) {
-    throw new Error(`Unexpected MCP response (not JSON): ${text.slice(0, 500)}`);
+    throw new Error(`Unexpected MCP response (invalid JSON): ${text.slice(0, 500)}`);
   }
 
-  if (payload?.error) throw new Error(payload.error.message || "MCP error");
+  if (!payload) {
+    throw new Error(`Unexpected MCP response (no SSE data): ${text.slice(0, 500)}`);
+  }
 
-  // Prefer structuredContent.result when available, otherwise fall back gracefully
-  const r = payload?.result;
+  if (payload?.error) {
+    throw new Error(payload?.error?.message || "MCP error");
+  }
 
-  // many MCP servers return: { result: { structuredContent: { result: [...] } } }
-  if (r?.structuredContent?.result !== undefined) return r.structuredContent.result;
+  const toolResult = payload?.result?.structuredContent?.result;
+  return toolResult ?? payload?.result ?? null;
+}
 
-  // some return: { result: [...] } directly
-  if (Array.isArray(r)) return r;
+function normalizeConditions(body) {
+  // MCP server expects `conditions` as a list of strings.
+  // Support `conditions` (list) or `where` (string) for backwards compatibility.
+  if (Array.isArray(body?.conditions)) return body.conditions.filter((x) => typeof x === "string" && x.trim());
+  if (typeof body?.where === "string" && body.where.trim()) return [body.where.trim()];
+  return [];
+}
 
-  // some return: { result: { result: [...] } }
-  if (r?.result !== undefined) return r.result;
-
-  return r ?? null;
+function safeString(x) {
+  return typeof x === "string" ? x : "";
 }
 
 app.get("/healthz", (_req, res) => res.send("ok"));
@@ -111,19 +100,10 @@ app.post("/api/list-accessible-customers", requireAuth, async (_req, res) => {
 
 app.post("/api/search", requireAuth, async (req, res) => {
   try {
-    const {
-      customer_id,
-      resource,
-      fields,
-      limit,
-      order_by,
-
-      // support BOTH styles:
-      // - where: "segments.date DURING LAST_30_DAYS"
-      // - conditions: ["segments.date DURING LAST_30_DAYS", "campaign.id = 123"]
-      where,
-      conditions
-    } = req.body || {};
+    const body = req.body || {};
+    const customer_id = body.customer_id;
+    const resource = body.resource;
+    const fields = body.fields;
 
     if (!customer_id || !resource || !Array.isArray(fields) || fields.length === 0) {
       return res.status(400).json({
@@ -131,20 +111,67 @@ app.post("/api/search", requireAuth, async (req, res) => {
       });
     }
 
+    const conditions = normalizeConditions(body);
+    const order_by = safeString(body.order_by).trim();
+    const limit = typeof body.limit === "number" ? body.limit : undefined;
+
     const args = { customer_id, resource, fields };
 
-    // MCP server expects `conditions` as a list (your pydantic error proved that)
-    if (Array.isArray(conditions) && conditions.length > 0) {
-      args.conditions = conditions;
-    } else if (typeof where === "string" && where.trim()) {
-      args.conditions = [where.trim()];
-    }
-
+    if (conditions.length) args.conditions = conditions;
+    if (order_by) args.order_by = order_by;
     if (typeof limit === "number") args.limit = limit;
-    if (typeof order_by === "string" && order_by.trim()) args.order_by = order_by.trim();
 
-    const result = await callMcpTool("search", args);
-    res.json({ result });
+    // First attempt
+    try {
+      const result = await callMcpTool("search", args);
+      return res.json({ result });
+    } catch (err) {
+      const msg = String(err?.message || err);
+
+      // Auto-fallback for the common ad_group_ad "type" serialization failure.
+      // If it fails, retry once with known-problematic fields removed.
+      const looksLikeTypeError =
+        msg === "type" ||
+        msg.endsWith(": type") ||
+        msg.includes("Error executing tool search: type");
+
+      if (resource === "ad_group_ad" && looksLikeTypeError) {
+        const removed = [];
+        const filteredFields = (fields || []).filter((f) => {
+          if (f === "ad_group_ad.ad.type") {
+            removed.push(f);
+            return false;
+          }
+          if (String(f).includes("responsive_search_ad.headlines")) {
+            removed.push(f);
+            return false;
+          }
+          if (String(f).includes("responsive_search_ad.descriptions")) {
+            removed.push(f);
+            return false;
+          }
+          return true;
+        });
+
+        if (filteredFields.length && removed.length) {
+          const retryArgs = { ...args, fields: filteredFields };
+          try {
+            const result = await callMcpTool("search", retryArgs);
+            return res.json({
+              result,
+              warnings: [
+                "Some requested ad fields cannot be serialized by the MCP server yet, so they were removed and the query was retried.",
+                `Removed fields: ${removed.join(", ")}`
+              ]
+            });
+          } catch (err2) {
+            return res.status(500).json({ error: String(err2?.message || err2) });
+          }
+        }
+      }
+
+      return res.status(500).json({ error: msg });
+    }
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
