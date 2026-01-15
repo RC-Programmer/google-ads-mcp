@@ -19,4 +19,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Use supergateway to wrap the stdio MCP server
-CMD supergateway --port $PORT --stdio "google-ads-mcp"
+CMD supergateway --port $PORT --baseUrl "https://google-ads-mcp-server.up.railway.app" --messagePath "/message" --ssePath "/sse" --stdio "google-ads-mcp"
