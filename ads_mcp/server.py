@@ -14,23 +14,6 @@
 """Entry point for the MCP server."""
 import os
 import uvicorn
-
-# Patch MCP security before importing mcp
-import mcp.server.sse as sse_module
-original_validate = getattr(sse_module, '_validate_request', None)
-def patched_validate(*args, **kwargs):
-    return True
-if hasattr(sse_module, '_validate_request'):
-    sse_module._validate_request = patched_validate
-
-# Also patch transport_security if it exists
-try:
-    import mcp.server.transport_security as ts
-    ts.validate_host_header = lambda *args, **kwargs: True
-    ts.is_valid_host = lambda *args, **kwargs: True
-except (ImportError, AttributeError):
-    pass
-
 from ads_mcp.coordinator import mcp
 # The following imports are necessary to register the tools with the `mcp`
 # object, even though they are not directly used in this file.
