@@ -14,7 +14,6 @@
 # limitations under the License.
 
 """Common utilities used by the MCP server."""
-
 from typing import Any
 import proto
 import logging
@@ -28,12 +27,16 @@ from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
 import os
 import importlib.resources
 
+from collections.abc import Sequence
+from google.protobuf.json_format import MessageToDict
+
 # filename for generated field information used by search
 _GAQL_FILENAME = "gaql_resources.json"
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Read-only scope for Analytics Admin API and Analytics Data API.
 _READ_ONLY_ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
 
 
@@ -86,62 +89,64 @@ _googleads_client = _get_googleads_client()
 
 
 def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
-    return _googleads_client.get_service(serviceName, interceptors=[MCPHeaderInterceptor()])
+    return _googleads_client.get_service(
+        serviceName, interceptors=[MCPHeaderInterceptor()]
+    )
 
 
 def get_googleads_type(typeName: str):
     return _googleads_client.get_type(typeName)
 
 
-def _to_jsonable(value: Any) -> Any:
-    """Convert Google Ads / proto / repeated containers into JSON-safe Python types."""
-    if value is None:
-        return None
+def _safe_get_nested_attr(row: proto.Message, attr: str) -> Any:
+    """
+    get_nested_attr doesn't always resolve protobuf fields named 'type' (often exposed as 'type_').
+    Try the raw attr first, then try a 'type' -> 'type_' fallback for the last segment only.
+    """
+    try:
+        val = get_nested_attr(row, attr)
+        if val is not None:
+            return val
+    except Exception:
+        pass
 
-    if isinstance(value, (str, int, float, bool)):
-        return value
+    # fallback for protobuf reserved word fields like 'type' => 'type_'
+    if attr.endswith(".type"):
+        try:
+            return get_nested_attr(row, attr + "_")  # ...ad.type_ style
+        except Exception:
+            return None
 
-    # Proto enum -> name
+    return None
+
+
+def format_output_value(value: Any) -> Any:
+    # Enums
     if isinstance(value, proto.Enum):
         return value.name
 
-    # Repeated containers from upb (best-effort imports)
-    try:
-        from google._upb._message import RepeatedScalarContainer, RepeatedCompositeContainer  # type: ignore
-        if isinstance(value, RepeatedScalarContainer):
-            return list(value)
-        if isinstance(value, RepeatedCompositeContainer):
-            return [_to_jsonable(v) for v in value]
-    except Exception:
-        pass
+    # Proto messages (e.g., RSA headlines/descriptions are message objects)
+    if isinstance(value, proto.Message):
+        try:
+            return MessageToDict(value, preserving_proto_field_name=True)
+        except Exception:
+            return str(value)
 
-    # Normal iterables
-    if isinstance(value, (list, tuple, set)):
-        return [_to_jsonable(v) for v in value]
+    # Repeated containers / lists / tuples (protobuf repeated fields often hit this)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            return [format_output_value(v) for v in list(value)]
+        except Exception:
+            return str(value)
 
-    # Proto message -> dict (proto-plus supports to_dict)
-    try:
-        if isinstance(value, proto.Message):
-            return value.to_dict()
-    except Exception:
-        pass
-
-    # Fallback: try string
-    try:
-        return str(value)
-    except Exception:
-        return None
+    # Scalars / None
+    return value
 
 
 def format_output_row(row: proto.Message, attributes):
-    # attributes is the requested GAQL field list (strings)
     out = {}
     for attr in attributes:
-        try:
-            raw = get_nested_attr(row, attr)
-        except Exception:
-            raw = None
-        out[attr] = _to_jsonable(raw)
+        out[attr] = format_output_value(_safe_get_nested_attr(row, attr))
     return out
 
 
