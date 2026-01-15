@@ -11,20 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Entry point for the MCP server."""
-
+import os
 from ads_mcp.coordinator import mcp
-
 # The following imports are necessary to register the tools with the `mcp`
 # object, even though they are not directly used in this file.
-# The `# noqa: F401` comment tells the linter to ignore the "unused import"
-# warning.
 from ads_mcp.tools import search, core  # noqa: F401
 
 
 def run_server() -> None:
-    mcp.run()
+    """Run the MCP server with SSE transport for remote connections."""
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    
+    if transport == "sse":
+        port = int(os.environ.get("PORT", "8080"))
+        mcp.run(transport="sse", host="0.0.0.0", port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
