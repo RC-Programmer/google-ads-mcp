@@ -29,23 +29,85 @@ function parseMcpSsePayload(sseText) {
   const lines = String(sseText || "").split("\n");
   const dataLines = lines.filter((l) => l.startsWith("data: "));
   if (!dataLines.length) return null;
-
   const last = dataLines[dataLines.length - 1].slice("data: ".length).trim();
   if (!last) return null;
-
   return JSON.parse(last);
 }
 
 function extractToolErrorFromResult(resultObj) {
-  // MCP tools can return errors as:
-  // result: { isError: true, content: [{type:"text", text:"..."}] }
   if (!resultObj || resultObj.isError !== true) return null;
-
   const firstText =
     Array.isArray(resultObj.content) &&
     resultObj.content.find((c) => c && c.type === "text" && typeof c.text === "string");
-
   return firstText?.text || "Tool returned isError:true";
+}
+
+function safeJson(value) {
+  const seen = new WeakSet();
+
+  const normalize = (v) => {
+    if (v == null) return v;
+
+    // primitives
+    const t = typeof v;
+    if (t === "string" || t === "number" || t === "boolean") return v;
+
+    // BigInt
+    if (t === "bigint") return v.toString();
+
+    // Buffer
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(v)) return v.toString("base64");
+
+    // Dates
+    if (v instanceof Date) return v.toISOString();
+
+    // Arrays
+    if (Array.isArray(v)) return v.map(normalize);
+
+    // Google protobuf / containers often look like array-like objects
+    if (typeof v === "object") {
+      // prevent cycles
+      if (seen.has(v)) return "[Circular]";
+      seen.add(v);
+
+      // Try common protobuf conversions
+      if (typeof v.toJSON === "function") {
+        try {
+          return normalize(v.toJSON());
+        } catch {
+          // fall through
+        }
+      }
+      if (typeof v.toObject === "function") {
+        try {
+          return normalize(v.toObject());
+        } catch {
+          // fall through
+        }
+      }
+
+      // If it's iterable (like RepeatedScalarContainer), turn into array
+      try {
+        if (typeof v[Symbol.iterator] === "function") {
+          return Array.from(v, normalize);
+        }
+      } catch {
+        // ignore
+      }
+
+      // Plain object
+      const out = {};
+      for (const [k, val] of Object.entries(v)) {
+        out[k] = normalize(val);
+      }
+      return out;
+    }
+
+    // fallback
+    return String(v);
+  };
+
+  return normalize(value);
 }
 
 async function callMcpTool(toolName, args) {
@@ -74,34 +136,24 @@ async function callMcpTool(toolName, args) {
     throw new Error(`Unexpected MCP response (invalid JSON): ${text.slice(0, 500)}`);
   }
 
-  if (!payload) {
-    throw new Error(`Unexpected MCP response (no SSE data): ${text.slice(0, 500)}`);
-  }
+  if (!payload) throw new Error(`Unexpected MCP response (no SSE data): ${text.slice(0, 500)}`);
 
-  // JSON-RPC style error
-  if (payload?.error) {
-    throw new Error(payload?.error?.message || "MCP error");
-  }
+  if (payload?.error) throw new Error(payload?.error?.message || "MCP error");
 
-  // Tool-style error (isError:true inside result)
   const toolStyleErr = extractToolErrorFromResult(payload?.result);
-  if (toolStyleErr) {
-    throw new Error(toolStyleErr);
-  }
+  if (toolStyleErr) throw new Error(toolStyleErr);
 
-  // Normal successful result
   const toolResult = payload?.result?.structuredContent?.result;
-  return toolResult ?? payload?.result ?? null;
+  const raw = toolResult ?? payload?.result ?? null;
+
+  // IMPORTANT: sanitize anything weird before we hand it back to Express/JSON
+  return safeJson(raw);
 }
 
 function normalizeConditions(body) {
-  // Your MCP server expects `conditions` as a list of strings.
   if (Array.isArray(body?.conditions))
     return body.conditions.filter((x) => typeof x === "string" && x.trim());
-
-  // Backwards compatibility if client sends `where`
   if (typeof body?.where === "string" && body.where.trim()) return [body.where.trim()];
-
   return [];
 }
 
@@ -136,59 +188,8 @@ app.post("/api/search", requireAuth, async (req, res) => {
     if (order_by) args.order_by = order_by;
     if (typeof limit === "number") args.limit = limit;
 
-    // Attempt #1
-    try {
-      const result = await callMcpTool("search", args);
-      return res.json({ result });
-    } catch (err) {
-      const msg = String(err?.message || err);
-
-      // Auto-fallback for the common ad_group_ad serialization crash ("type")
-      const looksLikeTypeError =
-        msg === "type" ||
-        msg.endsWith(": type") ||
-        msg.includes("Error executing tool search: type") ||
-        msg.toLowerCase().includes(" tool search: type");
-
-      if (resource === "ad_group_ad" && looksLikeTypeError) {
-        // Retry #2 with safer fields
-        const removed = [];
-        const filteredFields = (fields || []).filter((f) => {
-          const s = String(f);
-
-          // These have been triggering "type" crashes in your logs
-          if (s === "ad_group_ad.ad.type") {
-            removed.push(s);
-            return false;
-          }
-          if (s.includes("responsive_search_ad.headlines")) {
-            removed.push(s);
-            return false;
-          }
-          if (s.includes("responsive_search_ad.descriptions")) {
-            removed.push(s);
-            return false;
-          }
-          return true;
-        });
-
-        if (filteredFields.length) {
-          const retryArgs = { ...args, fields: filteredFields };
-          const result = await callMcpTool("search", retryArgs);
-
-          return res.json({
-            result,
-            warnings: [
-              "Your MCP server errors on some ad fields right now, so the wrapper retried without them.",
-              `Removed: ${removed.join(", ") || "(none)"}`,
-              "If you want RSA headlines/descriptions via API, we can add a dedicated endpoint that fetches ad text via ad_group_ad_asset_view / asset where supported."
-            ]
-          });
-        }
-      }
-
-      return res.status(500).json({ error: msg });
-    }
+    const result = await callMcpTool("search", args);
+    res.json({ result });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
