@@ -30,11 +30,22 @@ function parseMcpSsePayload(sseText) {
   const dataLines = lines.filter((l) => l.startsWith("data: "));
   if (!dataLines.length) return null;
 
-  // Take the last data: line (some responses can include multiple events)
   const last = dataLines[dataLines.length - 1].slice("data: ".length).trim();
   if (!last) return null;
 
   return JSON.parse(last);
+}
+
+function extractToolErrorFromResult(resultObj) {
+  // MCP tools can return errors as:
+  // result: { isError: true, content: [{type:"text", text:"..."}] }
+  if (!resultObj || resultObj.isError !== true) return null;
+
+  const firstText =
+    Array.isArray(resultObj.content) &&
+    resultObj.content.find((c) => c && c.type === "text" && typeof c.text === "string");
+
+  return firstText?.text || "Tool returned isError:true";
 }
 
 async function callMcpTool(toolName, args) {
@@ -59,7 +70,7 @@ async function callMcpTool(toolName, args) {
   let payload;
   try {
     payload = parseMcpSsePayload(text);
-  } catch (e) {
+  } catch {
     throw new Error(`Unexpected MCP response (invalid JSON): ${text.slice(0, 500)}`);
   }
 
@@ -67,32 +78,39 @@ async function callMcpTool(toolName, args) {
     throw new Error(`Unexpected MCP response (no SSE data): ${text.slice(0, 500)}`);
   }
 
+  // JSON-RPC style error
   if (payload?.error) {
     throw new Error(payload?.error?.message || "MCP error");
   }
 
+  // Tool-style error (isError:true inside result)
+  const toolStyleErr = extractToolErrorFromResult(payload?.result);
+  if (toolStyleErr) {
+    throw new Error(toolStyleErr);
+  }
+
+  // Normal successful result
   const toolResult = payload?.result?.structuredContent?.result;
   return toolResult ?? payload?.result ?? null;
 }
 
 function normalizeConditions(body) {
-  // MCP server expects `conditions` as a list of strings.
-  // Support `conditions` (list) or `where` (string) for backwards compatibility.
-  if (Array.isArray(body?.conditions)) return body.conditions.filter((x) => typeof x === "string" && x.trim());
-  if (typeof body?.where === "string" && body.where.trim()) return [body.where.trim()];
-  return [];
-}
+  // Your MCP server expects `conditions` as a list of strings.
+  if (Array.isArray(body?.conditions))
+    return body.conditions.filter((x) => typeof x === "string" && x.trim());
 
-function safeString(x) {
-  return typeof x === "string" ? x : "";
+  // Backwards compatibility if client sends `where`
+  if (typeof body?.where === "string" && body.where.trim()) return [body.where.trim()];
+
+  return [];
 }
 
 app.get("/healthz", (_req, res) => res.send("ok"));
 
 app.post("/api/list-accessible-customers", requireAuth, async (_req, res) => {
   try {
-    const result = await callMcpTool("list_accessible_customers", {});
-    res.json({ customers: result });
+    const customers = await callMcpTool("list_accessible_customers", {});
+    res.json({ customers });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -101,9 +119,7 @@ app.post("/api/list-accessible-customers", requireAuth, async (_req, res) => {
 app.post("/api/search", requireAuth, async (req, res) => {
   try {
     const body = req.body || {};
-    const customer_id = body.customer_id;
-    const resource = body.resource;
-    const fields = body.fields;
+    const { customer_id, resource, fields } = body;
 
     if (!customer_id || !resource || !Array.isArray(fields) || fields.length === 0) {
       return res.status(400).json({
@@ -112,61 +128,62 @@ app.post("/api/search", requireAuth, async (req, res) => {
     }
 
     const conditions = normalizeConditions(body);
-    const order_by = safeString(body.order_by).trim();
+    const order_by = typeof body.order_by === "string" ? body.order_by.trim() : "";
     const limit = typeof body.limit === "number" ? body.limit : undefined;
 
     const args = { customer_id, resource, fields };
-
     if (conditions.length) args.conditions = conditions;
     if (order_by) args.order_by = order_by;
     if (typeof limit === "number") args.limit = limit;
 
-    // First attempt
+    // Attempt #1
     try {
       const result = await callMcpTool("search", args);
       return res.json({ result });
     } catch (err) {
       const msg = String(err?.message || err);
 
-      // Auto-fallback for the common ad_group_ad "type" serialization failure.
-      // If it fails, retry once with known-problematic fields removed.
+      // Auto-fallback for the common ad_group_ad serialization crash ("type")
       const looksLikeTypeError =
         msg === "type" ||
         msg.endsWith(": type") ||
-        msg.includes("Error executing tool search: type");
+        msg.includes("Error executing tool search: type") ||
+        msg.toLowerCase().includes(" tool search: type");
 
       if (resource === "ad_group_ad" && looksLikeTypeError) {
+        // Retry #2 with safer fields
         const removed = [];
         const filteredFields = (fields || []).filter((f) => {
-          if (f === "ad_group_ad.ad.type") {
-            removed.push(f);
+          const s = String(f);
+
+          // These have been triggering "type" crashes in your logs
+          if (s === "ad_group_ad.ad.type") {
+            removed.push(s);
             return false;
           }
-          if (String(f).includes("responsive_search_ad.headlines")) {
-            removed.push(f);
+          if (s.includes("responsive_search_ad.headlines")) {
+            removed.push(s);
             return false;
           }
-          if (String(f).includes("responsive_search_ad.descriptions")) {
-            removed.push(f);
+          if (s.includes("responsive_search_ad.descriptions")) {
+            removed.push(s);
             return false;
           }
           return true;
         });
 
-        if (filteredFields.length && removed.length) {
+        if (filteredFields.length) {
           const retryArgs = { ...args, fields: filteredFields };
-          try {
-            const result = await callMcpTool("search", retryArgs);
-            return res.json({
-              result,
-              warnings: [
-                "Some requested ad fields cannot be serialized by the MCP server yet, so they were removed and the query was retried.",
-                `Removed fields: ${removed.join(", ")}`
-              ]
-            });
-          } catch (err2) {
-            return res.status(500).json({ error: String(err2?.message || err2) });
-          }
+          const result = await callMcpTool("search", retryArgs);
+
+          return res.json({
+            result,
+            warnings: [
+              "Your MCP server errors on some ad fields right now, so the wrapper retried without them.",
+              `Removed: ${removed.join(", ") || "(none)"}`,
+              "If you want RSA headlines/descriptions via API, we can add a dedicated endpoint that fetches ad text via ad_group_ad_asset_view / asset where supported."
+            ]
+          });
         }
       }
 
