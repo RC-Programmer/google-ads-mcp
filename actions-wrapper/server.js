@@ -4,8 +4,8 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8080;
-const MCP_URL = process.env.MCP_URL; // e.g. https://google-ads-mcp-server.up.railway.app/mcp
-const API_TOKEN = process.env.API_TOKEN; // secret token stored in Railway
+const MCP_URL = process.env.MCP_URL;
+const API_TOKEN = process.env.API_TOKEN;
 
 if (!MCP_URL) throw new Error("Missing MCP_URL");
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
@@ -54,7 +54,6 @@ async function callMcpTool(toolName, args) {
   const payload = JSON.parse(dataLine.replace("data: ", ""));
   if (payload?.error) throw new Error(payload.error.message || "MCP error");
 
-  // Your server returns tool results under result.structuredContent.result
   const toolResult = payload?.result?.structuredContent?.result;
   return toolResult ?? payload?.result ?? null;
 }
@@ -80,16 +79,40 @@ app.post("/api/search", requireAuth, async (req, res) => {
       });
     }
 
-    // IMPORTANT:
-    // The Google Ads MCP server expects the WHERE clause under `conditions` (not `where`).
-    // We accept either input key for convenience, but we always pass `conditions` to MCP.
     const args = { customer_id, resource, fields };
 
-    const cond = typeof conditions === "string" ? conditions : (typeof where === "string" ? where : undefined);
-    if (typeof cond === "string") args.conditions = cond;
+    // MCP expects `conditions` as a LIST of strings.
+    // Accept any of:
+    // - conditions: ["a", "b"]
+    // - conditions: "a"
+    // - where: "a" (legacy alias)
+    let condList = null;
+
+    if (Array.isArray(conditions)) {
+      condList = conditions
+        .filter((x) => typeof x === "string")
+        .map((x) => x.trim())
+        .filter(Boolean);
+    } else if (typeof conditions === "string" && conditions.trim()) {
+      condList = [conditions.trim()];
+    } else if (typeof where === "string" && where.trim()) {
+      condList = [where.trim()];
+    }
+
+    if (condList && condList.length) args.conditions = condList;
 
     if (typeof limit === "number") args.limit = limit;
-    if (typeof order_by === "string") args.order_by = order_by;
+
+    // MCP tool uses `orderings` (plural) and expects a list
+    if (Array.isArray(order_by)) {
+      const orderings = order_by
+        .filter((x) => typeof x === "string")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      if (orderings.length) args.orderings = orderings;
+    } else if (typeof order_by === "string" && order_by.trim()) {
+      args.orderings = [order_by.trim()];
+    }
 
     const result = await callMcpTool("search", args);
     res.json({ result });
