@@ -27,7 +27,6 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// Streamable HTTP MCP responses come back as text/event-stream with lines like: data: {...}
 async function callMcpTool(toolName, args) {
   const body = {
     jsonrpc: "2.0",
@@ -47,9 +46,10 @@ async function callMcpTool(toolName, args) {
 
   const text = await resp.text();
 
-  // Find the first "data: {json...}" line
   const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
-  if (!dataLine) throw new Error(`Unexpected MCP response: ${text.slice(0, 500)}`);
+  if (!dataLine) {
+    throw new Error(`Unexpected MCP response: ${text.slice(0, 500)}`);
+  }
 
   const payload = JSON.parse(dataLine.replace("data: ", ""));
   if (payload?.error) throw new Error(payload.error.message || "MCP error");
@@ -71,7 +71,15 @@ app.post("/api/list-accessible-customers", requireAuth, async (_req, res) => {
 
 app.post("/api/search", requireAuth, async (req, res) => {
   try {
-    const { customer_id, resource, fields, limit, where, conditions, order_by } = req.body || {};
+    const {
+      customer_id,
+      resource,
+      fields,
+      limit,
+      where,        // allow GPT Actions "where"
+      conditions,   // allow direct MCP "conditions"
+      order_by      // simple string input from callers
+    } = req.body || {};
 
     if (!customer_id || !resource || !Array.isArray(fields) || fields.length === 0) {
       return res.status(400).json({
@@ -79,38 +87,21 @@ app.post("/api/search", requireAuth, async (req, res) => {
       });
     }
 
-    const args = { customer_id, resource, fields };
-
-    // MCP expects `conditions` as a LIST of strings.
-    // Accept any of:
-    // - conditions: ["a", "b"]
-    // - conditions: "a"
-    // - where: "a" (legacy alias)
-    let condList = null;
-
-    if (Array.isArray(conditions)) {
-      condList = conditions
-        .filter((x) => typeof x === "string")
-        .map((x) => x.trim())
-        .filter(Boolean);
-    } else if (typeof conditions === "string" && conditions.trim()) {
-      condList = [conditions.trim()];
+    // Normalize date/filters to MCP format: conditions must be a LIST of strings
+    let normalizedConditions = null;
+    if (Array.isArray(conditions) && conditions.length > 0) {
+      normalizedConditions = conditions;
     } else if (typeof where === "string" && where.trim()) {
-      condList = [where.trim()];
+      normalizedConditions = [where.trim()];
     }
 
-    if (condList && condList.length) args.conditions = condList;
+    const args = { customer_id, resource, fields };
 
     if (typeof limit === "number") args.limit = limit;
+    if (normalizedConditions) args.conditions = normalizedConditions;
 
-    // MCP tool uses `orderings` (plural) and expects a list
-    if (Array.isArray(order_by)) {
-      const orderings = order_by
-        .filter((x) => typeof x === "string")
-        .map((x) => x.trim())
-        .filter(Boolean);
-      if (orderings.length) args.orderings = orderings;
-    } else if (typeof order_by === "string" && order_by.trim()) {
+    // MCP expects "orderings" (list). We accept a single "order_by" string.
+    if (typeof order_by === "string" && order_by.trim()) {
       args.orderings = [order_by.trim()];
     }
 
