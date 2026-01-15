@@ -27,7 +27,17 @@ def run_server() -> None:
     if transport == "sse":
         port = int(os.environ.get("PORT", "8080"))
         app = mcp.sse_app()
-        uvicorn.run(app, host="0.0.0.0", port=port)
+        
+        # Disable host header checking for Railway deployment
+        config = uvicorn.Config(
+            app, 
+            host="0.0.0.0", 
+            port=port,
+            forwarded_allow_ips="*",
+            proxy_headers=True
+        )
+        server = uvicorn.Server(config)
+        server.run()
     else:
         mcp.run()
 
