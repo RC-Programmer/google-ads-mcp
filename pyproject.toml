@@ -5,9 +5,11 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = [
     "google-ads>=28.0.0",
-    "mcp[cli]>=1.2.0"
+    "mcp[cli]>=1.2.0",
+    "starlette",
+    "uvicorn",
+    "sse-starlette"
 ]
-
 description = "MCP Server for Google Ads, depends on Google Ads API."
 readme = "README.md"
 authors = [{ name = "Dean Lukies", email = "lukiesd@users.noreply.github.com" }]
@@ -17,13 +19,11 @@ classifiers = [
     "Intended Audience :: End Users/Desktop",
     "Programming Language :: Python"
 ]
-
 [project.optional-dependencies]
 dev = [
     "black",
     "nox >=2025.5.1, <2026"
 ]
-
 [project.urls]
 homepage = "https://github.com/googleads/google-ads-mcp"
 repository = "https://github.com/googleads/google-ads-mcp.git"
