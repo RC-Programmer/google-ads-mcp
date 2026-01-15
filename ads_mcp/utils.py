@@ -14,24 +14,22 @@
 # limitations under the License.
 """Common utilities used by the MCP server."""
 
-from __future__ import annotations
-
-from typing import Any, Dict, List, Optional
+from typing import Any
+import proto
 import logging
 import os
 import importlib.resources
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 
-import proto
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.v21.services.services.google_ads_service import (
     GoogleAdsServiceClient,
 )
+from google.ads.googleads.util import get_nested_attr
 from google.oauth2.credentials import Credentials
 from google.protobuf.json_format import MessageToDict
 
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
-
 
 # filename for generated field information used by search
 _GAQL_FILENAME = "gaql_resources.json"
@@ -66,15 +64,15 @@ def _create_credentials() -> Credentials:
 
 
 def _get_developer_token() -> str:
-    """Returns the developer token from env var GOOGLE_ADS_DEVELOPER_TOKEN."""
+    """Returns the developer token from GOOGLE_ADS_DEVELOPER_TOKEN."""
     dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
     if dev_token is None:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set.")
     return dev_token
 
 
-def _get_login_customer_id() -> Optional[str]:
-    """Returns login customer id from env var GOOGLE_ADS_LOGIN_CUSTOMER_ID (optional)."""
+def _get_login_customer_id() -> str | None:
+    """Returns login customer id, if set, from GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
     return os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
 
 
@@ -89,85 +87,73 @@ def _get_googleads_client() -> GoogleAdsClient:
 _googleads_client = _get_googleads_client()
 
 
-def get_googleads_service(service_name: str) -> GoogleAdsServiceClient:
-    return _googleads_client.get_service(service_name, interceptors=[MCPHeaderInterceptor()])
+def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
+    return _googleads_client.get_service(serviceName, interceptors=[MCPHeaderInterceptor()])
 
 
-def get_googleads_type(type_name: str):
-    return _googleads_client.get_type(type_name)
+def get_googleads_type(typeName: str):
+    return _googleads_client.get_type(typeName)
+
+
+def _proto_to_dict(value: Any) -> Any:
+    # proto-plus objects often expose .to_dict() and/or ._pb
+    try:
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            return value.to_dict()
+    except Exception:
+        pass
+
+    try:
+        if hasattr(value, "_pb"):
+            return MessageToDict(value._pb, preserving_proto_field_name=True)
+    except Exception:
+        pass
+
+    try:
+        # Some objects might already be protobuf messages
+        return MessageToDict(value, preserving_proto_field_name=True)
+    except Exception:
+        return str(value)
+
+
+def format_output_value(value: Any) -> Any:
+    # None
+    if value is None:
+        return None
+
+    # Enums
+    if isinstance(value, proto.Enum):
+        return value.name
+
+    # Primitives
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return bytes(value).decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+
+    # Mappings
+    if isinstance(value, Mapping):
+        return {str(k): format_output_value(v) for k, v in value.items()}
+
+    # Repeated / sequences (including Google repeated containers)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [format_output_value(v) for v in list(value)]
+
+    # Proto messages (covers AdTextAsset and friends)
+    if isinstance(value, proto.Message) or hasattr(value, "_pb") or hasattr(value, "to_dict"):
+        return _proto_to_dict(value)
+
+    # Fallback
+    return str(value)
+
+
+def format_output_row(row: proto.Message, attributes):
+    return {attr: format_output_value(get_nested_attr(row, attr)) for attr in attributes}
 
 
 def get_gaql_resources_filepath():
     package_root = importlib.resources.files("ads_mcp")
     return package_root.joinpath(_GAQL_FILENAME)
-
-
-def _safe_get_nested_attr(obj: Any, path: str) -> Any:
-    """
-    Safely traverses nested protobuf fields using a dotted path.
-
-    Important: GA protobufs often use `type_` in Python for fields named `type`.
-    GAQL uses `.type`, so we map `type` -> `type_` during traversal.
-    """
-    cur = obj
-    for part in path.split("."):
-        if cur is None:
-            return None
-
-        # Map GAQL "type" field to python protobuf "type_"
-        if part == "type":
-            part = "type_"
-
-        try:
-            cur = getattr(cur, part)
-        except Exception:
-            return None
-
-    return cur
-
-
-def _proto_to_python(value: Any) -> Any:
-    """
-    Convert protobuf / proto-plus objects (including repeated containers) into
-    JSON-serializable Python primitives.
-    """
-    if value is None:
-        return None
-
-    # proto-plus Enum -> name
-    if isinstance(value, proto.Enum):
-        return value.name
-
-    # proto-plus Message OR protobuf Message -> dict
-    if isinstance(value, proto.Message):
-        return MessageToDict(
-            value,
-            preserving_proto_field_name=True,
-            including_default_value_fields=False,
-            use_integers_for_enums=False,
-        )
-
-    # Repeated containers (scalar or message)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        out: List[Any] = []
-        for item in value:
-            out.append(_proto_to_python(item))
-        return out
-
-    # Fallback for other objects (ints, floats, strings, bools, etc.)
-    return value
-
-
-def format_output_value(value: Any) -> Any:
-    return _proto_to_python(value)
-
-
-def format_output_row(row: proto.Message, attributes: List[str]) -> Dict[str, Any]:
-    """
-    Formats a GoogleAdsRow into a flat dict keyed by the GAQL field paths.
-    """
-    output: Dict[str, Any] = {}
-    for attr in attributes:
-        raw = _safe_get_nested_attr(row, attr)
-        output[attr] = format_output_value(raw)
-    return output
