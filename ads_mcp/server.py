@@ -14,10 +14,32 @@
 """Entry point for the MCP server."""
 import os
 import uvicorn
+from starlette.middleware import Middleware
+from starlette.applications import Starlette
+from starlette.routing import Mount
 from ads_mcp.coordinator import mcp
 # The following imports are necessary to register the tools with the `mcp`
 # object, even though they are not directly used in this file.
 from ads_mcp.tools import search, core  # noqa: F401
+
+
+class HostHeaderMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # Override host header to localhost to bypass validation
+            headers = dict(scope.get("headers", []))
+            new_headers = []
+            for key, value in scope.get("headers", []):
+                if key == b"host":
+                    new_headers.append((key, b"localhost"))
+                else:
+                    new_headers.append((key, value))
+            scope = dict(scope)
+            scope["headers"] = new_headers
+        await self.app(scope, receive, send)
 
 
 def run_server() -> None:
@@ -26,18 +48,12 @@ def run_server() -> None:
     
     if transport == "sse":
         port = int(os.environ.get("PORT", "8080"))
-        app = mcp.sse_app()
+        sse_app = mcp.sse_app()
         
-        # Disable host header checking for Railway deployment
-        config = uvicorn.Config(
-            app, 
-            host="0.0.0.0", 
-            port=port,
-            forwarded_allow_ips="*",
-            proxy_headers=True
-        )
-        server = uvicorn.Server(config)
-        server.run()
+        # Wrap with middleware to fix host header
+        app = HostHeaderMiddleware(sse_app)
+        
+        uvicorn.run(app, host="0.0.0.0", port=port)
     else:
         mcp.run()
 
