@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 Google LLC.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Common utilities used by the MCP server."""
-
 from typing import Any
 import proto
 import logging
@@ -23,9 +20,8 @@ from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.v21.services.services.google_ads_service import (
     GoogleAdsServiceClient,
 )
-
 from google.ads.googleads.util import get_nested_attr
-import google.auth
+from google.oauth2.credentials import Credentials
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
 import os
 import importlib.resources
@@ -40,9 +36,26 @@ logging.basicConfig(level=logging.INFO)
 _READ_ONLY_ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
 
 
-def _create_credentials() -> google.auth.credentials.Credentials:
-    """Returns Application Default Credentials with read-only scope."""
-    (credentials, _) = google.auth.default(scopes=[_READ_ONLY_ADS_SCOPE])
+def _create_credentials() -> Credentials:
+    """Returns OAuth credentials from environment variables."""
+    client_id = os.environ.get("GOOGLE_ADS_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_ADS_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_ADS_REFRESH_TOKEN")
+    
+    if not all([client_id, client_secret, refresh_token]):
+        raise ValueError(
+            "Missing OAuth credentials. Set GOOGLE_ADS_CLIENT_ID, "
+            "GOOGLE_ADS_CLIENT_SECRET, and GOOGLE_ADS_REFRESH_TOKEN."
+        )
+    
+    credentials = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=[_READ_ONLY_ADS_SCOPE]
+    )
     return credentials
 
 
@@ -62,14 +75,11 @@ def _get_login_customer_id() -> str:
 
 
 def _get_googleads_client() -> GoogleAdsClient:
-    # Use this line if you have a google-ads.yaml file
-    # client = GoogleAdsClient.load_from_storage()
     client = GoogleAdsClient(
         credentials=_create_credentials(),
         developer_token=_get_developer_token(),
         login_customer_id=_get_login_customer_id(),
     )
-
     return client
 
 
