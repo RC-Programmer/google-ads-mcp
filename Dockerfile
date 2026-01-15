@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install --no-cache-dir .
+
+ENV MCP_TRANSPORT=sse
+ENV PORT=8080
+
+EXPOSE 8080
+
+CMD ["google-ads-mcp"]
