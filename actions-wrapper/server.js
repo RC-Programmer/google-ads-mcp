@@ -4,33 +4,61 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8080;
-const MCP_URL = process.env.MCP_URL;
+const MCP_URL = process.env.MCP_URL; // should point to your supergateway MCP endpoint (e.g. https://.../mcp)
 const API_TOKEN = process.env.API_TOKEN;
 
 if (!MCP_URL) throw new Error("Missing MCP_URL");
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 
+function normalizeToken(v) {
+  if (!v) return "";
+  // trims, removes surrounding < > that people accidentally paste
+  return String(v).trim().replace(/^<|>$/g, "");
+}
+
 function requireAuth(req, res, next) {
-  const auth = (req.headers.authorization || "").trim();
-  const xApiKey = (req.headers["x-api-key"] || "").trim();
-  const token = (req.headers["api-key"] || "").trim();
+  const authRaw = (req.headers.authorization || "").trim();
+  const xApiKeyRaw = (req.headers["x-api-key"] || "").trim();
+  const apiKeyRaw = (req.headers["api-key"] || "").trim();
+
+  const auth = normalizeToken(authRaw);
+  const xApiKey = normalizeToken(xApiKeyRaw);
+  const apiKey = normalizeToken(apiKeyRaw);
+
+  const expected = normalizeToken(API_TOKEN);
 
   const ok =
-    auth === `Bearer ${API_TOKEN}` ||
-    auth === API_TOKEN ||
-    xApiKey === API_TOKEN ||
-    token === API_TOKEN;
+    auth === `Bearer ${expected}` ||
+    auth === expected ||
+    xApiKey === expected ||
+    apiKey === expected;
 
-  if (!ok) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
+  if (!ok) return res.status(403).json({ error: "Forbidden" });
   next();
+}
+
+let rpcId = 1;
+
+function parseMcpResponseText(text) {
+  // supergateway often replies as text/event-stream, so we extract the LAST data: line
+  const dataLines = text
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.startsWith("data: "));
+
+  if (dataLines.length > 0) {
+    const last = dataLines[dataLines.length - 1].slice("data: ".length);
+    return JSON.parse(last);
+  }
+
+  // sometimes it may be plain JSON
+  return JSON.parse(text);
 }
 
 async function callMcpTool(toolName, args) {
   const body = {
     jsonrpc: "2.0",
-    id: 1,
+    id: rpcId++,
     method: "tools/call",
     params: { name: toolName, arguments: args || {} }
   };
@@ -46,16 +74,28 @@ async function callMcpTool(toolName, args) {
 
   const text = await resp.text();
 
-  const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
-  if (!dataLine) {
-    throw new Error(`Unexpected MCP response: ${text.slice(0, 500)}`);
+  let payload;
+  try {
+    payload = parseMcpResponseText(text);
+  } catch (e) {
+    throw new Error(`Unexpected MCP response (not JSON): ${text.slice(0, 500)}`);
   }
 
-  const payload = JSON.parse(dataLine.replace("data: ", ""));
   if (payload?.error) throw new Error(payload.error.message || "MCP error");
 
-  const toolResult = payload?.result?.structuredContent?.result;
-  return toolResult ?? payload?.result ?? null;
+  // Prefer structuredContent.result when available, otherwise fall back gracefully
+  const r = payload?.result;
+
+  // many MCP servers return: { result: { structuredContent: { result: [...] } } }
+  if (r?.structuredContent?.result !== undefined) return r.structuredContent.result;
+
+  // some return: { result: [...] } directly
+  if (Array.isArray(r)) return r;
+
+  // some return: { result: { result: [...] } }
+  if (r?.result !== undefined) return r.result;
+
+  return r ?? null;
 }
 
 app.get("/healthz", (_req, res) => res.send("ok"));
@@ -76,9 +116,13 @@ app.post("/api/search", requireAuth, async (req, res) => {
       resource,
       fields,
       limit,
-      where,        // allow GPT Actions "where"
-      conditions,   // allow direct MCP "conditions"
-      order_by      // simple string input from callers
+      order_by,
+
+      // support BOTH styles:
+      // - where: "segments.date DURING LAST_30_DAYS"
+      // - conditions: ["segments.date DURING LAST_30_DAYS", "campaign.id = 123"]
+      where,
+      conditions
     } = req.body || {};
 
     if (!customer_id || !resource || !Array.isArray(fields) || fields.length === 0) {
@@ -87,23 +131,17 @@ app.post("/api/search", requireAuth, async (req, res) => {
       });
     }
 
-    // Normalize date/filters to MCP format: conditions must be a LIST of strings
-    let normalizedConditions = null;
-    if (Array.isArray(conditions) && conditions.length > 0) {
-      normalizedConditions = conditions;
-    } else if (typeof where === "string" && where.trim()) {
-      normalizedConditions = [where.trim()];
-    }
-
     const args = { customer_id, resource, fields };
 
-    if (typeof limit === "number") args.limit = limit;
-    if (normalizedConditions) args.conditions = normalizedConditions;
-
-    // MCP expects "orderings" (list). We accept a single "order_by" string.
-    if (typeof order_by === "string" && order_by.trim()) {
-      args.orderings = [order_by.trim()];
+    // MCP server expects `conditions` as a list (your pydantic error proved that)
+    if (Array.isArray(conditions) && conditions.length > 0) {
+      args.conditions = conditions;
+    } else if (typeof where === "string" && where.trim()) {
+      args.conditions = [where.trim()];
     }
+
+    if (typeof limit === "number") args.limit = limit;
+    if (typeof order_by === "string" && order_by.trim()) args.order_by = order_by.trim();
 
     const result = await callMcpTool("search", args);
     res.json({ result });
