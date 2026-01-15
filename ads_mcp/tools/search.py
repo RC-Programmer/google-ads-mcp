@@ -36,18 +36,17 @@ def search(
         conditions: List of conditions to filter the data, combined using AND clauses
         orderings: How the data is ordered
         limit: The maximum number of rows to return
-
     """
 
     ga_service = utils.get_googleads_service("GoogleAdsService")
 
-    query_parts = [f"SELECT {','.join(fields)} FROM {resource}"]
+    query_parts = [f"SELECT {', '.join(fields)} FROM {resource}"]
 
     if conditions:
         query_parts.append(f" WHERE {' AND '.join(conditions)}")
 
     if orderings:
-        query_parts.append(f" ORDER BY {','.join(orderings)}")
+        query_parts.append(f" ORDER BY {', '.join(orderings)}")
 
     if limit:
         query_parts.append(f" LIMIT {limit}")
@@ -55,22 +54,19 @@ def search(
     query = "".join(query_parts)
     utils.logger.info(f"ads_mcp.search query {query}")
 
-    query_result = ga_service.search_stream(
-        customer_id=customer_id, query=query
-    )
+    query_result = ga_service.search_stream(customer_id=customer_id, query=query)
 
-    final_output: List = []
+    final_output: List[Dict[str, Any]] = []
     for batch in query_result:
         for row in batch.results:
-            final_output.append(
-                utils.format_output_row(row, batch.field_mask.paths)
-            )
+            # IMPORTANT: use the requested `fields` list (not field_mask.paths)
+            final_output.append(utils.format_output_row(row, fields))
+
     return final_output
 
 
 def _search_tool_description() -> str:
     """Returns the description for the `search` tool."""
-    # Add a warning that will be part of the description
     file_content = (
         "WARNING: The table of selectable fields is missing. "
         "Tool may not function correctly."
@@ -104,8 +100,7 @@ def _search_tool_description() -> str:
     Requests to resource change_event must specify a LIMIT of less than or equal to 10000
 
 ### Hints for conversions questions
-    https://developers.google.com/google-ads/api/docs/conversions/upload-summaries 
-
+    https://developers.google.com/google-ads/api/docs/conversions/upload-summaries
 
 ### Hints for all fields
     What follows is a table of resources and their selectable fields (fields), filterable fields (used in the condition) and sortable fields (use in the ordering)
@@ -115,10 +110,6 @@ def _search_tool_description() -> str:
 """
 
 
-# The `search` tool requires a more complex description that's generated at
-# runtime. Uses the `add_tool` method instead of an annnotation since `add_tool`
-# provides the flexibility needed to generate the description while also
-# including the `search` method's docstring.
 mcp.add_tool(
     search,
     title="Fetches data from the Google Ads API using the search method",
