@@ -1,14 +1,22 @@
-FROM python:3.12-slim
+FROM node:20-slim
+
+# Install Python for Google Ads MCP
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv git && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy the Google Ads MCP code
 COPY . .
 
-RUN pip install --no-cache-dir .
+# Install Google Ads MCP
+RUN pip3 install --break-system-packages .
 
-ENV MCP_TRANSPORT=sse
+# Install supergateway globally
+RUN npm install -g supergateway
+
 ENV PORT=8080
 
 EXPOSE 8080
 
-CMD ["google-ads-mcp"]
+# Use supergateway to wrap the stdio MCP server
+CMD supergateway --port $PORT --stdio "google-ads-mcp"
