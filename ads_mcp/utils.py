@@ -13,21 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Common utilities used by the MCP server."""
-from __future__ import annotations
-
-from typing import Any, Dict, List
+from typing import Any
 import proto
 import logging
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.v21.services.services.google_ads_service import (
     GoogleAdsServiceClient,
 )
+from google.ads.googleads.util import get_nested_attr
 from google.oauth2.credentials import Credentials
-from google.protobuf.message import Message
-from google.protobuf.json_format import MessageToDict
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
 import os
 import importlib.resources
+
+# NEW: for robust protobuf -> dict conversion
+from google.protobuf.message import Message as PbMessage
+from google.protobuf.json_format import MessageToDict
 
 # filename for generated field information used by search
 _GAQL_FILENAME = "gaql_resources.json"
@@ -35,7 +36,7 @@ _GAQL_FILENAME = "gaql_resources.json"
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Read-only scope for Google Ads API.
+# Read-only scope for Analytics Admin API and Analytics Data API.
 _READ_ONLY_ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
 
 
@@ -95,70 +96,51 @@ def get_googleads_type(typeName: str):
     return _googleads_client.get_type(typeName)
 
 
-def _to_jsonable(value: Any) -> Any:
+def format_output_value(value: Any) -> Any:
     """
-    Convert protobuf / repeated containers / nested structures into plain JSON-safe
-    Python types (dict, list, str, int, float, bool, None).
+    Convert Google Ads / protobuf values into JSON-serializable types.
+    This is the key fix for fields like:
+      - ad.final_urls (RepeatedScalarContainer)
+      - rsa.headlines / descriptions (RepeatedCompositeContainer)
     """
     if value is None:
         return None
 
-    # Enum -> name (ex: ENABLED)
+    # Enums -> name
     if isinstance(value, proto.Enum):
         return value.name
 
     # Protobuf message -> dict
-    if isinstance(value, Message):
+    if isinstance(value, PbMessage):
+        # MessageToDict handles nested messages, repeated fields, etc.
         return MessageToDict(
             value,
             preserving_proto_field_name=True,
             including_default_value_fields=False,
-            use_integers_for_enums=True,
+            use_integers_for_enums=False,
         )
 
-    # Protobuf repeated containers:
-    # google._upb._message.RepeatedScalarContainer / RepeatedCompositeContainer
-    # They behave like iterables but are not JSON serializable.
-    mod = getattr(value.__class__, "__module__", "")
-    name = getattr(value.__class__, "__name__", "")
-    if mod.startswith("google.") and "Repeated" in name:
-        return [_to_jsonable(v) for v in list(value)]
-
-    # Normal containers
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-
-    if isinstance(value, (list, tuple, set)):
-        return [_to_jsonable(v) for v in value]
-
-    # Bytes -> decode best-effort
-    if isinstance(value, (bytes, bytearray)):
+    # Map-like containers -> dict
+    if hasattr(value, "items") and callable(getattr(value, "items")):
         try:
-            return value.decode("utf-8", errors="replace")
+            return {k: format_output_value(v) for k, v in value.items()}
         except Exception:
-            return str(value)
+            pass
 
-    # Scalars are already JSON-safe
+    # Repeated containers / lists / tuples -> list
+    # (Catches google._upb._message.RepeatedScalarContainer and RepeatedCompositeContainer)
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict)):
+        try:
+            return [format_output_value(v) for v in list(value)]
+        except Exception:
+            pass
+
+    # Primitive values are already JSON-safe
     return value
 
 
-def format_output_row(row: proto.Message, attributes: List[str]) -> Dict[str, Any]:
-    """
-    Return a dict mapping each requested field path to a JSON-safe value.
-    """
-    out: Dict[str, Any] = {}
-    for attr in attributes:
-        raw = getattr(row, attr.split(".")[0], None)
-
-        # Fallback: use get_nested_attr for nested paths
-        try:
-            raw = get_nested_attr(row, attr)
-        except Exception:
-            raw = None
-
-        out[attr] = _to_jsonable(raw)
-
-    return out
+def format_output_row(row: proto.Message, attributes):
+    return {attr: format_output_value(get_nested_attr(row, attr)) for attr in attributes}
 
 
 def get_gaql_resources_filepath():
