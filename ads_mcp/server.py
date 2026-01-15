@@ -25,7 +25,10 @@ def run_server() -> None:
     
     if transport == "sse":
         port = int(os.environ.get("PORT", "8080"))
-        mcp.run(transport="sse", host="0.0.0.0", port=port)
+        # Set environment variables that FastMCP reads
+        os.environ["MCP_HTTP_PORT"] = str(port)
+        os.environ["MCP_HTTP_HOST"] = "0.0.0.0"
+        mcp.run(transport="sse")
     else:
         mcp.run()
 
