@@ -11,9 +11,18 @@ if (!MCP_URL) throw new Error("Missing MCP_URL");
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 
 function requireAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  if (auth !== `Bearer ${API_TOKEN}`) {
-    return res.status(401).json({ error: "Unauthorized" });
+  const auth = (req.headers.authorization || "").trim();
+  const xApiKey = (req.headers["x-api-key"] || "").trim();
+  const token = (req.headers["api-key"] || "").trim();
+
+  const ok =
+    auth === `Bearer ${API_TOKEN}` ||
+    auth === API_TOKEN ||
+    xApiKey === API_TOKEN ||
+    token === API_TOKEN;
+
+  if (!ok) {
+    return res.status(403).json({ error: "Forbidden" });
   }
   next();
 }
