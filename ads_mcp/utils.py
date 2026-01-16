@@ -101,11 +101,43 @@ def get_googleads_type(typeName: str):
     return _googleads_client.get_type(typeName)
 
 
-def _is_iterable_container(value: Any) -> bool:
-    # Treat repeated containers as iterables, but avoid strings/bytes.
+def _is_repeated_container(value: Any) -> bool:
+    """
+    Detect protobuf repeated containers, including upb-backed containers that
+    sometimes don't present a normal __iter__ attribute.
+    """
+    if value is None:
+        return False
+
     if isinstance(value, (str, bytes, bytearray)):
         return False
-    return hasattr(value, "__iter__")
+
+    if isinstance(value, Mapping):
+        return False
+
+    # proto.Message is handled separately (it serializes to dict via ListFields)
+    if isinstance(value, proto.Message):
+        return False
+
+    t = type(value)
+    mod = getattr(t, "__module__", "") or ""
+    name = getattr(t, "__name__", "") or ""
+
+    # Common C++ upb container types:
+    # google._upb._message.RepeatedScalarContainer
+    # google._upb._message.RepeatedCompositeContainer
+    if mod.startswith("google._upb._message") and name.startswith("Repeated"):
+        return True
+
+    # Fallback: sequence protocol support
+    # Many containers implement __len__ and __getitem__ even if __iter__ isn't obvious.
+    if hasattr(value, "__iter__"):
+        return True
+
+    if hasattr(value, "__len__") and hasattr(value, "__getitem__"):
+        return True
+
+    return False
 
 
 def _get_attr_with_reserved_fallback(obj: Any, name: str) -> Any:
@@ -116,19 +148,16 @@ def _get_attr_with_reserved_fallback(obj: Any, name: str) -> Any:
     if obj is None:
         raise AttributeError(name)
 
-    # First try the original name.
     try:
         return getattr(obj, name)
     except Exception:
         pass
 
-    # Then try reserved-word fallback: name_
     try:
         return getattr(obj, f"{name}_")
     except Exception:
         pass
 
-    # As a final fallback, if caller passed name_ already, try without underscore.
     if name.endswith("_"):
         try:
             return getattr(obj, name[:-1])
@@ -155,7 +184,7 @@ def format_output_value(value: Any) -> Any:
 
     Special cases:
       - AdTextAsset -> return .text
-      - repeated containers -> list
+      - repeated containers -> list (recursively converted)
       - proto.Enum -> its name
       - proto.Message / protobuf Message -> dict recursively
     """
@@ -167,8 +196,8 @@ def format_output_value(value: Any) -> Any:
         if isinstance(value, proto.Enum):
             return value.name
 
-        # AdTextAsset (RSA headlines/descriptions items)
-        # Avoid importing the class directly; identify by type name + expected field.
+        # RSA asset objects (headlines/descriptions list items)
+        # Convert each AdTextAsset to plain text.
         tname = type(value).__name__
         if tname == "AdTextAsset" and hasattr(value, "text"):
             return getattr(value, "text")
@@ -177,10 +206,9 @@ def format_output_value(value: Any) -> Any:
         if isinstance(value, Mapping):
             return {str(k): format_output_value(v) for k, v in value.items()}
 
-        # Repeated containers / lists / tuples / proto repeated fields
-        # NOTE: do this BEFORE proto.Message so repeated containers don't get treated as messages.
-        if _is_iterable_container(value) and not isinstance(value, proto.Message):
-            return [format_output_value(v) for v in list(value)]
+        # Protobuf repeated containers / list-like objects
+        if _is_repeated_container(value):
+            return [format_output_value(v) for v in value]
 
         # proto-plus messages
         if isinstance(value, proto.Message):
@@ -205,16 +233,18 @@ def format_output_value(value: Any) -> Any:
                 out[attr] = format_output_value(v)
             return out
 
-        # protobuf messages (if any slip through as raw protobuf types)
-        if ProtobufMessage is not None and isinstance(value, ProtobufMessage) and MessageToDict is not None:
-            # This yields JSON-serializable structures (dicts/lists/scalars).
+        # protobuf messages (raw protobuf types)
+        if (
+            ProtobufMessage is not None
+            and isinstance(value, ProtobufMessage)
+            and MessageToDict is not None
+        ):
             return MessageToDict(value, preserving_proto_field_name=True)
 
         # Basic scalars
         return value
 
     except Exception:
-        # Never let serialization explode the whole response.
         try:
             logger.exception("format_output_value failed for %s", type(value))
         except Exception:
@@ -229,7 +259,6 @@ def format_output_row(row: Any, attributes: list[str]) -> dict[str, Any]:
             raw_val = get_nested_attr_safe(row, attr)
             out[attr] = format_output_value(raw_val)
         except Exception:
-            # Keep the response usable even if a specific field can't be extracted.
             try:
                 logger.exception("Failed to extract field '%s'", attr)
             except Exception:
