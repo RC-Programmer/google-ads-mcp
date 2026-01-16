@@ -12,16 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Common utilities used by the MCP server."""
-
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 from collections.abc import Mapping, Sequence
+import importlib.resources
 import logging
 import os
-import importlib.resources
 
 import proto
 from google.ads.googleads.client import GoogleAdsClient
@@ -56,7 +54,7 @@ def _create_credentials() -> Credentials:
             "GOOGLE_ADS_CLIENT_SECRET, and GOOGLE_ADS_REFRESH_TOKEN."
         )
 
-    return Credentials(
+    credentials = Credentials(
         token=None,
         refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
@@ -64,10 +62,11 @@ def _create_credentials() -> Credentials:
         client_secret=client_secret,
         scopes=[_READ_ONLY_ADS_SCOPE],
     )
+    return credentials
 
 
 def _get_developer_token() -> str:
-    """Returns the developer token from GOOGLE_ADS_DEVELOPER_TOKEN."""
+    """Returns the developer token from the environment variable GOOGLE_ADS_DEVELOPER_TOKEN."""
     dev_token = os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN")
     if dev_token is None:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set.")
@@ -75,123 +74,117 @@ def _get_developer_token() -> str:
 
 
 def _get_login_customer_id() -> str | None:
-    """Returns login customer id, if set, from GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
+    """Returns login customer id, if set, from the environment variable GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
     return os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
 
 
 def _get_googleads_client() -> GoogleAdsClient:
-    """Builds a GoogleAdsClient instance with interceptor support."""
-    return GoogleAdsClient(
+    client = GoogleAdsClient(
         credentials=_create_credentials(),
         developer_token=_get_developer_token(),
         login_customer_id=_get_login_customer_id(),
     )
+    return client
 
 
 _googleads_client = _get_googleads_client()
 
 
-def get_googleads_service(service_name: str) -> GoogleAdsServiceClient:
-    """Returns a Google Ads API service with MCP header interceptor."""
-    return _googleads_client.get_service(
-        service_name, interceptors=[MCPHeaderInterceptor()]
-    )
+def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
+    return _googleads_client.get_service(serviceName, interceptors=[MCPHeaderInterceptor()])
 
 
-def get_googleads_type(type_name: str):
-    """Returns a Google Ads API message type."""
-    return _googleads_client.get_type(type_name)
+def get_googleads_type(typeName: str):
+    return _googleads_client.get_type(typeName)
 
 
-def safe_get_nested_attr(row: Any, attr: str) -> Any:
-    """Safely get a nested attribute (GAQL field path) from a row."""
-    try:
-        return get_nested_attr(row, attr)
-    except Exception:
-        return None
-
-
-def _is_sequence(v: Any) -> bool:
-    return isinstance(v, Sequence) and not isinstance(v, (str, bytes, bytearray))
-
-
-def format_output_value(value: Any) -> Any:
+def _flatten_text_assets(value: Any) -> Any:
     """
-    Convert Google Ads API values (proto / protobuf) into JSON-safe primitives.
-
-    Key behavior needed here:
-    - AdTextAsset (RSA headlines/descriptions) becomes its plain text value.
-    - Repeated containers become normal Python lists.
-    - Unknown message objects get converted to dict where possible.
+    Convert AdTextAsset-ish objects to plain strings.
+    Accepts:
+      - list[dict] with {'text': ...}
+      - list[proto.Message] that become dicts
+      - dict with {'text': ...}
     """
-    if value is None:
-        return None
-
-    # Lists/tuples/repeated fields
-    if _is_sequence(value):
-        return [format_output_value(v) for v in value]
-
-    # Dict-like
     if isinstance(value, Mapping):
-        return {k: format_output_value(v) for k, v in value.items()}
+        if "text" in value and isinstance(value.get("text"), str):
+            return value["text"]
+        return value
 
-    # proto-plus Enums
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        out: list[Any] = []
+        for item in value:
+            if isinstance(item, Mapping) and "text" in item and isinstance(item.get("text"), str):
+                out.append(item["text"])
+            else:
+                out.append(item)
+        return out
+
+    return value
+
+
+def _to_plain(value: Any, *, attr_path: str | None = None) -> Any:
+    """
+    Recursively convert protobuf / proto-plus objects into JSON-serializable Python types.
+
+    Special-case:
+      - RSA headlines/descriptions -> list[str] (just the 'text' field)
+    """
+    # Enums
     if isinstance(value, proto.Enum):
         return value.name
 
-    # proto-plus Messages (Google Ads commonly returns these)
+    # Protobuf / proto-plus Messages
     if isinstance(value, proto.Message):
-        # AdTextAsset and other text-bearing assets
-        if hasattr(value, "text"):
-            txt = getattr(value, "text", None)
-            if isinstance(txt, str):
-                return txt
+        as_dict = MessageToDict(
+            value,
+            preserving_proto_field_name=True,
+            including_default_value_fields=False,
+            use_integers_for_enums=False,
+        )
+        # If we're serializing a text asset itself, compress to text
+        if isinstance(as_dict, dict) and "text" in as_dict and isinstance(as_dict.get("text"), str):
+            return as_dict["text"]
+        return as_dict
 
-        # Convert to dict via underlying protobuf message if available
-        try:
-            if hasattr(value, "_pb"):
-                return format_output_value(
-                    MessageToDict(value._pb, preserving_proto_field_name=True)
-                )
-        except Exception:
-            pass
+    # Repeated containers / lists / tuples
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_to_plain(v, attr_path=attr_path) for v in value]
 
-        # Last resort: stringify
-        return str(value)
+    # Dicts
+    if isinstance(value, Mapping):
+        return {k: _to_plain(v, attr_path=attr_path) for k, v in value.items()}
 
-    # Raw protobuf message
-    if hasattr(value, "DESCRIPTOR"):
-        try:
-            return format_output_value(
-                MessageToDict(value, preserving_proto_field_name=True)
-            )
-        except Exception:
-            return str(value)
-
-    # Primitives
-    if isinstance(value, (str, int, float, bool)):
-        return value
-
-    # Bytes
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value).decode("utf-8", errors="replace")
-
-    # Fallback
-    return str(value)
+    return value
 
 
-def format_output_row(row: proto.Message, attributes) -> Dict[str, Any]:
+def format_output_value(value: Any, attr_path: str | None = None) -> Any:
     """
-    Formats a Google Ads row into a JSON-safe dict based on field mask paths.
+    Converts Google Ads API field values into JSON-serializable types.
+
+    Key behavior:
+      - Enums -> string names
+      - Messages -> dict
+      - Repeated values -> list
+      - RSA headlines/descriptions -> list[str] (text only)
     """
-    out: Dict[str, Any] = {}
-    for attr in attributes:
-        raw_val = safe_get_nested_attr(row, attr)
-        out[attr] = format_output_value(raw_val)
-    return out
+    plain = _to_plain(value, attr_path=attr_path)
+
+    # Only flatten to plain text list for specific RSA fields requested by you.
+    if attr_path and (
+        attr_path.endswith(".responsive_search_ad.headlines")
+        or attr_path.endswith(".responsive_search_ad.descriptions")
+    ):
+        return _flatten_text_assets(plain)
+
+    return plain
+
+
+def format_output_row(row: proto.Message, attributes):
+    return {attr: format_output_value(get_nested_attr(row, attr), attr) for attr in attributes}
 
 
 def get_gaql_resources_filepath():
-    """Returns the packaged path to gaql_resources.json."""
     package_root = importlib.resources.files("ads_mcp")
-    return package_root.joinpath(_GAQL_FILENAME)
+    file_path = package_root.joinpath(_GAQL_FILENAME)
+    return file_path
