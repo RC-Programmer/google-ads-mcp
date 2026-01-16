@@ -12,20 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Common utilities used by the MCP server."""
 
+from __future__ import annotations
+
 from typing import Any
+import datetime
+import decimal
+import importlib.resources
 import logging
 import os
-import importlib.resources
 
 import proto
 from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.util import get_nested_attr
 from google.ads.googleads.v21.services.services.google_ads_service import (
     GoogleAdsServiceClient,
 )
-from google.ads.googleads.util import get_nested_attr
 from google.oauth2.credentials import Credentials
 
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
@@ -71,7 +74,7 @@ def _get_developer_token() -> str:
     return dev_token
 
 
-def _get_login_customer_id() -> str:
+def _get_login_customer_id() -> str | None:
     """Returns login customer id, if set, from the environment variable GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
     return os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
 
@@ -89,9 +92,7 @@ _googleads_client = _get_googleads_client()
 
 
 def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
-    return _googleads_client.get_service(
-        serviceName, interceptors=[MCPHeaderInterceptor()]
-    )
+    return _googleads_client.get_service(serviceName, interceptors=[MCPHeaderInterceptor()])
 
 
 def get_googleads_type(typeName: str):
@@ -99,51 +100,81 @@ def get_googleads_type(typeName: str):
 
 
 def _is_repeated_container(value: Any) -> bool:
-    # protobuf repeated containers don't serialize, but behave like lists
-    t = type(value).__name__
-    return t in ("RepeatedCompositeContainer", "RepeatedScalarContainer")
+    """
+    Google Ads protobufs frequently return these internal container types:
+      - google._upb._message.RepeatedScalarContainer
+      - google._upb._message.RepeatedCompositeContainer
+    They are iterable but not JSON serializable, so we convert them to lists.
+    """
+    if value is None:
+        return False
+    tname = type(value).__name__
+    return tname in ("RepeatedScalarContainer", "RepeatedCompositeContainer")
+
+
+def _message_to_dict(msg: proto.Message) -> dict[str, Any]:
+    """
+    Best-effort conversion of a proto-plus message into a JSON-serializable dict.
+    Only includes fields that are actually set.
+    """
+    # proto-plus messages wrap a protobuf message in ._pb
+    pb = getattr(msg, "_pb", None)
+    if pb is None or not hasattr(pb, "ListFields"):
+        # Fallback to string if we can't introspect
+        return {"_value": str(msg)}
+
+    out: dict[str, Any] = {}
+    for field_desc, field_value in pb.ListFields():
+        out[field_desc.name] = format_output_value(field_value)
+    return out
 
 
 def format_output_value(value: Any) -> Any:
     """
-    Converts Google Ads API (proto / proto-plus) values into JSON-serializable types.
+    Convert Google Ads API return values into JSON-serializable Python objects.
 
-    - Enums -> enum name
-    - Repeated containers -> list
-    - Proto messages:
-        - If they have `.text` (ex: AdTextAsset), return that text
-        - else try `.to_dict()`
-        - else fallback to `str(value)`
+    Special behavior:
+    - AdTextAsset (RSA headline/description objects) -> return just the plain `text`
+    - Repeated* containers -> plain Python lists
+    - proto messages -> dict of set fields (best-effort)
     """
     if value is None:
         return None
 
-    # Enums -> "ENUM_NAME"
+    # Enums -> name
     if isinstance(value, proto.Enum):
         return value.name
 
-    # Repeated containers / lists -> list of serialized items
-    if isinstance(value, (list, tuple)) or _is_repeated_container(value):
+    # Already-serializable primitives
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Common scalars
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+
+    # Google protobuf repeated containers (not JSON serializable)
+    if _is_repeated_container(value) or isinstance(value, (list, tuple, set)):
         return [format_output_value(v) for v in list(value)]
 
-    # Proto messages (AdTextAsset, etc.)
+    # proto-plus messages (includes AdTextAsset, PolicySummaryInfo, etc.)
     if isinstance(value, proto.Message):
-        # If you want JUST the text for RSA assets:
+        # Make RSA assets readable: headlines/descriptions are AdTextAsset messages.
+        # They always have a `text` field; return just that.
         if hasattr(value, "text"):
-            return getattr(value, "text")
+            txt = getattr(value, "text", None)
+            if txt is not None:
+                return txt
 
-        # Otherwise, fall back to a dict (best-effort)
-        if hasattr(value, "to_dict"):
-            d = value.to_dict()
-            if isinstance(d, dict):
-                return {k: format_output_value(v) for k, v in d.items()}
-            return format_output_value(d)
+        # Otherwise convert to dict (only set fields)
+        return _message_to_dict(value)
 
-        # Last resort: stringify
-        return str(value)
-
-    # Plain scalars
-    return value
+    # Last resort: stringify (keeps server from crashing)
+    return str(value)
 
 
 def format_output_row(row: proto.Message, attributes):
