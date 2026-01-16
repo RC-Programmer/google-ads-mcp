@@ -13,25 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Common utilities used by the MCP server."""
-
-from __future__ import annotations
-
 from typing import Any
-import datetime
-import decimal
-import importlib.resources
-import logging
-import os
-
 import proto
+import logging
 from google.ads.googleads.client import GoogleAdsClient
-from google.ads.googleads.util import get_nested_attr
 from google.ads.googleads.v21.services.services.google_ads_service import (
     GoogleAdsServiceClient,
 )
+from google.ads.googleads.util import get_nested_attr
 from google.oauth2.credentials import Credentials
-
 from ads_mcp.mcp_header_interceptor import MCPHeaderInterceptor
+import os
+import importlib.resources
 
 # filename for generated field information used by search
 _GAQL_FILENAME = "gaql_resources.json"
@@ -39,7 +32,7 @@ _GAQL_FILENAME = "gaql_resources.json"
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Read-only scope for Google Ads API.
+# Read-only scope for Analytics Admin API and Analytics Data API.
 _READ_ONLY_ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
 
 
@@ -74,7 +67,7 @@ def _get_developer_token() -> str:
     return dev_token
 
 
-def _get_login_customer_id() -> str | None:
+def _get_login_customer_id() -> str:
     """Returns login customer id, if set, from the environment variable GOOGLE_ADS_LOGIN_CUSTOMER_ID."""
     return os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID")
 
@@ -92,7 +85,9 @@ _googleads_client = _get_googleads_client()
 
 
 def get_googleads_service(serviceName: str) -> GoogleAdsServiceClient:
-    return _googleads_client.get_service(serviceName, interceptors=[MCPHeaderInterceptor()])
+    return _googleads_client.get_service(
+        serviceName, interceptors=[MCPHeaderInterceptor()]
+    )
 
 
 def get_googleads_type(typeName: str):
@@ -100,81 +95,60 @@ def get_googleads_type(typeName: str):
 
 
 def _is_repeated_container(value: Any) -> bool:
-    """
-    Google Ads protobufs frequently return these internal container types:
-      - google._upb._message.RepeatedScalarContainer
-      - google._upb._message.RepeatedCompositeContainer
-    They are iterable but not JSON serializable, so we convert them to lists.
-    """
-    if value is None:
-        return False
+    # Handles google._upb._message.RepeatedScalarContainer / RepeatedCompositeContainer
+    # without importing their classes directly.
     tname = type(value).__name__
-    return tname in ("RepeatedScalarContainer", "RepeatedCompositeContainer")
+    return tname.startswith("Repeated") or tname.endswith("Container")
 
 
-def _message_to_dict(msg: proto.Message) -> dict[str, Any]:
-    """
-    Best-effort conversion of a proto-plus message into a JSON-serializable dict.
-    Only includes fields that are actually set.
-    """
-    # proto-plus messages wrap a protobuf message in ._pb
-    pb = getattr(msg, "_pb", None)
-    if pb is None or not hasattr(pb, "ListFields"):
-        # Fallback to string if we can't introspect
-        return {"_value": str(msg)}
-
-    out: dict[str, Any] = {}
-    for field_desc, field_value in pb.ListFields():
-        out[field_desc.name] = format_output_value(field_value)
-    return out
-
-
-def format_output_value(value: Any) -> Any:
-    """
-    Convert Google Ads API return values into JSON-serializable Python objects.
-
-    Special behavior:
-    - AdTextAsset (RSA headline/description objects) -> return just the plain `text`
-    - Repeated* containers -> plain Python lists
-    - proto messages -> dict of set fields (best-effort)
-    """
+def _walk_jsonable(value: Any) -> Any:
+    # Make anything JSON-serializable, preferring plain strings for asset objects.
     if value is None:
         return None
 
-    # Enums -> name
     if isinstance(value, proto.Enum):
         return value.name
 
-    # Already-serializable primitives
     if isinstance(value, (str, int, float, bool)):
         return value
 
-    # Common scalars
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    if isinstance(value, (datetime.date, datetime.datetime)):
-        return value.isoformat()
-    if isinstance(value, decimal.Decimal):
-        return float(value)
+    if isinstance(value, dict):
+        return {str(k): _walk_jsonable(v) for k, v in value.items()}
 
-    # Google protobuf repeated containers (not JSON serializable)
-    if _is_repeated_container(value) or isinstance(value, (list, tuple, set)):
-        return [format_output_value(v) for v in list(value)]
+    if isinstance(value, (list, tuple, set)) or _is_repeated_container(value):
+        return [_walk_jsonable(v) for v in list(value)]
 
-    # proto-plus messages (includes AdTextAsset, PolicySummaryInfo, etc.)
+    # Proto-plus messages (Google Ads API objects, including AdTextAsset)
     if isinstance(value, proto.Message):
-        # Make RSA assets readable: headlines/descriptions are AdTextAsset messages.
-        # They always have a `text` field; return just that.
+        # If it looks like an AdTextAsset (or similar) return plain text only.
         if hasattr(value, "text"):
-            txt = getattr(value, "text", None)
-            if txt is not None:
-                return txt
+            try:
+                txt = getattr(value, "text")
+                if isinstance(txt, str):
+                    return txt
+            except Exception:
+                pass
 
-        # Otherwise convert to dict (only set fields)
-        return _message_to_dict(value)
+        # Otherwise convert to dict and recursively sanitize it.
+        try:
+            as_dict = value.to_dict()
+            return _walk_jsonable(as_dict)
+        except Exception:
+            # Last resort: string representation
+            return str(value)
 
-    # Last resort: stringify (keeps server from crashing)
+    # Catch-all: iterables that aren't strings/bytes (some protobuf containers)
+    try:
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+            return [_walk_jsonable(v) for v in list(value)]
+    except Exception:
+        pass
+
     return str(value)
+
+
+def format_output_value(value: Any) -> Any:
+    return _walk_jsonable(value)
 
 
 def format_output_row(row: proto.Message, attributes):
