@@ -97,7 +97,7 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
     date_ranges = _get_date_ranges()
     metrics = {"customer_id": customer_id}
     
-    # Base query fields
+    # Base query fields (removed metrics.average_cpv - only works for video campaigns)
     base_fields = """
         metrics.cost_micros,
         metrics.impressions,
@@ -109,7 +109,6 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
         metrics.ctr,
         metrics.average_cpc,
         metrics.average_cpm,
-        metrics.average_cpv,
         metrics.average_cost,
         metrics.interactions,
         metrics.interaction_rate,
@@ -176,7 +175,7 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
             metrics[f"ctr{suffix}"] = _extract_metric(row, "metrics.ctr")
             metrics[f"average_cpc{suffix}"] = _extract_metric(row, "metrics.average_cpc")
             metrics[f"average_cpm{suffix}"] = _extract_metric(row, "metrics.average_cpm")
-            metrics[f"average_cpv{suffix}"] = _extract_metric(row, "metrics.average_cpv")
+            metrics[f"average_cpv{suffix}"] = 0  # Video-only metric, set to 0
             metrics[f"average_cost{suffix}"] = _extract_metric(row, "metrics.average_cost")
             metrics[f"interactions{suffix}"] = _extract_metric(row, "metrics.interactions")
             metrics[f"interaction_rate{suffix}"] = _extract_metric(row, "metrics.interaction_rate")
