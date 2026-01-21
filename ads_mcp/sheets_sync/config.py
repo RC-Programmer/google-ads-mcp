@@ -2,7 +2,7 @@
 
 # Google Sheet settings
 SPREADSHEET_ID = "1QHQzY8razWXJHSdj2TE5EpayidyLBCi94QjFLQBN6OI"
-SHEET_NAME = "GOOGLE DATA"
+SHEET_NAME = "[FOR TEST] GOOGLE DATA"
 
 # Discord webhook for notifications
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1449129401064100091/mwhW59cwQOV4yIRCmKi1pENP-0Nb2ZDHy55402uVTmby01sQbFxfPY6yN7IpLqBFS0uL"
