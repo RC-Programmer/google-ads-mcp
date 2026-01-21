@@ -13,7 +13,6 @@ def _get_date_ranges() -> Dict[str, tuple]:
     """Calculate date ranges for current month, last month, 2 months ago, 1 year ago."""
     today = datetime.now()
     
-    # If today is the 1st, use complete previous month as current
     if today.day == 1:
         yesterday = today - timedelta(days=1)
         current_start = yesterday.replace(day=1)
@@ -23,23 +22,18 @@ def _get_date_ranges() -> Dict[str, tuple]:
         current_start = today.replace(day=1)
         current_end = yesterday
     
-    # Last month
     last_month_end = current_start - timedelta(days=1)
     last_month_start = last_month_end.replace(day=1)
     
-    # Two months ago
     two_months_end = last_month_start - timedelta(days=1)
     two_months_start = two_months_end.replace(day=1)
     
-    # One year ago (same month last year)
     one_year_start = current_start.replace(year=current_start.year - 1)
-    # Get last day of that month
     if one_year_start.month == 12:
         one_year_end = one_year_start.replace(year=one_year_start.year + 1, month=1, day=1) - timedelta(days=1)
     else:
         one_year_end = one_year_start.replace(month=one_year_start.month + 1, day=1) - timedelta(days=1)
     
-    # Yesterday, 2 days ago, 3 days ago
     two_days_ago = today - timedelta(days=2)
     three_days_ago = today - timedelta(days=3)
     
@@ -55,16 +49,13 @@ def _get_date_ranges() -> Dict[str, tuple]:
 
 
 def _format_date(dt: datetime) -> str:
-    """Format date as YYYY-MM-DD for GAQL."""
     return dt.strftime("%Y-%m-%d")
 
 
 def _run_query(customer_id: str, query: str) -> Optional[Dict[str, Any]]:
-    """Run a GAQL query and return first row as dict."""
     try:
         ga_service = utils.get_googleads_service("GoogleAdsService")
         result = ga_service.search_stream(customer_id=customer_id, query=query)
-        
         for batch in result:
             for row in batch.results:
                 return row
@@ -75,17 +66,13 @@ def _run_query(customer_id: str, query: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_metric(row: Any, field: str) -> Any:
-    """Safely extract a metric from a row."""
     try:
         parts = field.split(".")
         value = row
         for part in parts:
             value = getattr(value, part)
-        
-        # Convert micros to dollars
         if "micros" in field:
             return float(value) / 1_000_000
-        
         return value
     except Exception:
         return 0
@@ -97,7 +84,7 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
     date_ranges = _get_date_ranges()
     metrics = {"customer_id": customer_id}
     
-    # Base query fields (removed metrics.average_cpv - only works for video campaigns)
+    # Base query fields - only metrics compatible with CUSTOMER resource
     base_fields = """
         metrics.cost_micros,
         metrics.impressions,
@@ -120,8 +107,6 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
         metrics.search_exact_match_impression_share,
         metrics.search_budget_lost_impression_share,
         metrics.search_rank_lost_impression_share,
-        metrics.search_absolute_top_impression_share,
-        metrics.search_top_impression_share,
         metrics.content_impression_share,
         metrics.content_budget_lost_impression_share,
         metrics.content_rank_lost_impression_share,
@@ -131,13 +116,9 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
         metrics.active_view_measurability,
         metrics.active_view_measurable_cost_micros,
         metrics.invalid_clicks,
-        metrics.invalid_click_rate,
-        metrics.phone_calls,
-        metrics.phone_impressions,
-        metrics.phone_through_rate
+        metrics.invalid_click_rate
     """
     
-    # Query for each time period
     period_suffixes = {
         "current": "",
         "last_month": "_last_month",
@@ -164,7 +145,6 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
                 except:
                     metrics["account_name"] = ""
             
-            # Extract all metrics
             metrics[f"cost{suffix}"] = _extract_metric(row, "metrics.cost_micros")
             metrics[f"impressions{suffix}"] = _extract_metric(row, "metrics.impressions")
             metrics[f"clicks{suffix}"] = _extract_metric(row, "metrics.clicks")
@@ -175,7 +155,7 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
             metrics[f"ctr{suffix}"] = _extract_metric(row, "metrics.ctr")
             metrics[f"average_cpc{suffix}"] = _extract_metric(row, "metrics.average_cpc")
             metrics[f"average_cpm{suffix}"] = _extract_metric(row, "metrics.average_cpm")
-            metrics[f"average_cpv{suffix}"] = 0  # Video-only metric, set to 0
+            metrics[f"average_cpv{suffix}"] = 0
             metrics[f"average_cost{suffix}"] = _extract_metric(row, "metrics.average_cost")
             metrics[f"interactions{suffix}"] = _extract_metric(row, "metrics.interactions")
             metrics[f"interaction_rate{suffix}"] = _extract_metric(row, "metrics.interaction_rate")
@@ -187,8 +167,8 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
             metrics[f"search_exact_match_impression_share{suffix}"] = _extract_metric(row, "metrics.search_exact_match_impression_share")
             metrics[f"search_budget_lost_impression_share{suffix}"] = _extract_metric(row, "metrics.search_budget_lost_impression_share")
             metrics[f"search_rank_lost_impression_share{suffix}"] = _extract_metric(row, "metrics.search_rank_lost_impression_share")
-            metrics[f"absolute_top_impression_percentage{suffix}"] = _extract_metric(row, "metrics.search_absolute_top_impression_share")
-            metrics[f"top_impression_percentage{suffix}"] = _extract_metric(row, "metrics.search_top_impression_share")
+            metrics[f"absolute_top_impression_percentage{suffix}"] = 0  # Not available on CUSTOMER
+            metrics[f"top_impression_percentage{suffix}"] = 0  # Not available on CUSTOMER
             metrics[f"content_impression_share{suffix}"] = _extract_metric(row, "metrics.content_impression_share")
             metrics[f"content_budget_lost_impression_share{suffix}"] = _extract_metric(row, "metrics.content_budget_lost_impression_share")
             metrics[f"content_rank_lost_impression_share{suffix}"] = _extract_metric(row, "metrics.content_rank_lost_impression_share")
@@ -199,9 +179,9 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
             metrics[f"active_view_measurable_cost_micros{suffix}"] = _extract_metric(row, "metrics.active_view_measurable_cost_micros")
             metrics[f"invalid_clicks{suffix}"] = _extract_metric(row, "metrics.invalid_clicks")
             metrics[f"invalid_click_rate{suffix}"] = _extract_metric(row, "metrics.invalid_click_rate")
-            metrics[f"phone_calls{suffix}"] = _extract_metric(row, "metrics.phone_calls")
-            metrics[f"phone_impressions{suffix}"] = _extract_metric(row, "metrics.phone_impressions")
-            metrics[f"phone_through_rate{suffix}"] = _extract_metric(row, "metrics.phone_through_rate")
+            metrics[f"phone_calls{suffix}"] = 0  # Not available on CUSTOMER
+            metrics[f"phone_impressions{suffix}"] = 0  # Not available on CUSTOMER
+            metrics[f"phone_through_rate{suffix}"] = 0  # Not available on CUSTOMER
     
     # Yesterday, 2 days ago, 3 days ago spend and conversions
     for period in ["yesterday", "two_days_ago", "three_days_ago"]:
@@ -222,46 +202,31 @@ def get_account_metrics(customer_id: str) -> Dict[str, Any]:
             elif period == "three_days_ago":
                 metrics["spend_3_days_ago"] = _extract_metric(row, "metrics.cost_micros")
     
-    # Get daily budget from enabled campaigns
     metrics["daily_budget"] = _get_total_daily_budget(customer_id)
-    
-    # Last updated timestamp
     metrics["last_updated"] = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
     
     return metrics
 
 
 def _get_total_daily_budget(customer_id: str) -> float:
-    """Get total daily budget from all enabled campaigns."""
     try:
         ga_service = utils.get_googleads_service("GoogleAdsService")
-        
         query = """
-            SELECT
-                campaign.id,
-                campaign_budget.amount_micros,
-                campaign_budget.explicitly_shared
+            SELECT campaign.id, campaign_budget.amount_micros, campaign_budget.explicitly_shared
             FROM campaign
-            WHERE campaign.status = 'ENABLED'
-              AND campaign.serving_status = 'SERVING'
+            WHERE campaign.status = 'ENABLED' AND campaign.serving_status = 'SERVING'
         """
-        
         result = ga_service.search_stream(customer_id=customer_id, query=query)
-        
         total_budget = 0.0
         seen_budgets = set()
-        
         for batch in result:
             for row in batch.results:
                 budget_micros = row.campaign_budget.amount_micros
                 is_shared = row.campaign_budget.explicitly_shared
-                
-                # For shared budgets, only count once
                 budget_key = budget_micros if is_shared else row.campaign.id
                 if budget_key not in seen_budgets:
                     seen_budgets.add(budget_key)
                     total_budget += budget_micros / 1_000_000
-        
         return total_budget
     except Exception as e:
         logger.error(f"Failed to get daily budget for {customer_id}: {e}")
@@ -269,7 +234,6 @@ def _get_total_daily_budget(customer_id: str) -> float:
 
 
 def get_accessible_customer_ids() -> List[str]:
-    """Get list of accessible customer IDs from MCC."""
     try:
         customer_service = utils.get_googleads_service("CustomerService")
         response = customer_service.list_accessible_customers()
