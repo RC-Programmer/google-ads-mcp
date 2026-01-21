@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy all files
+COPY . .
+
+# Install the package with all dependencies
+RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir google-api-python-client google-auth requests
+
+# Run the sync
+CMD ["python", "-m", "ads_mcp.sheets_sync.run_sync"]
