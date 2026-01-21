@@ -2,15 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-
-# Copy application code
+# Copy all files
 COPY . .
 
-# Install the package
+# Install the package with all dependencies
 RUN pip install --no-cache-dir .
+
+# Install additional dependencies for sheets sync
+RUN pip install --no-cache-dir google-api-python-client google-auth requests
 
 ENV MCP_TRANSPORT=sse
 ENV PORT=8080
